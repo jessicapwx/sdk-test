@@ -446,3 +446,12 @@ func summarizeErrorsFromStringErrorChanMap(stringErrMap map[string]chan (error))
 	}
 	return fmt.Errorf("%s", summarizedErrMsg)
 }
+
+func getKeyOtherThanInMap(StrStrMap map[string]string, key string) string {
+	for k, _ := range StrStrMap {
+		if k != key {
+			return k
+		}
+	}
+	return ""
+}

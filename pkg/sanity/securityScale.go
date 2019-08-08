@@ -3,6 +3,7 @@ package sanity
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 )
 
 var scaleUsers map[string]string
-var userVolumeMap *common.ConcMap
+var userVolumeMap *common.ConcStrToStrMap
 
 type VolumeRequest struct {
 	VolID         string
@@ -61,6 +62,16 @@ var _ = Describe("Security Scale", func() {
 			err := inspectVolumesConcurrently(c)
 			Expect(err).NotTo(HaveOccurred())
 		})
+		It("Should be disallowed to inspect other users' Volume", func() {
+			By("Inspecting other users' volumes")
+			err := inspectOtherVolumesConcurrently(c)
+			Expect(err).NotTo(HaveOccurred())
+		})
+		It("Should be disallowed to delete other users' Volume", func() {
+			By("Deleting other users' volumes")
+			err := deleteOtherVolumesConcurrently(c)
+			Expect(err).NotTo(HaveOccurred())
+		})
 		It("Owner Should be able to delete its own Volume", func() {
 			By("Deleting volumes")
 			err := deleteVolumesConcurrently(c)
@@ -72,7 +83,7 @@ var _ = Describe("Security Scale", func() {
 
 func createVolumesConcurrently(c api.OpenStorageVolumeClient) error {
 	//userVolumeMap is mapping user'name to volumes' ID
-	userVolumeMap = common.NewConcMap()
+	userVolumeMap = common.NewConcStrToStrMap()
 	var volErrorMap = common.NewConcStringErrChanMap()
 	var wg sync.WaitGroup
 	for name, userToken := range scaleUsers {
@@ -115,9 +126,7 @@ func createVolumesConcurrently(c api.OpenStorageVolumeClient) error {
 func inspectVolumesConcurrently(c api.OpenStorageVolumeClient) error {
 	var wg sync.WaitGroup
 	var volErrorMap = common.NewConcStringErrChanMap()
-	for user, id := range userVolumeMap.GetKeyValMap() {
-		userName := user.(string)
-		volID := id.(string)
+	for userName, volID := range userVolumeMap.GetKeyValMap() {
 		fmt.Printf("\nNow user %s is going to inspect volume %s", userName, volID)
 		token := scaleUsers[userName]
 		wg.Add(1)
@@ -142,9 +151,7 @@ func inspectVolumesConcurrently(c api.OpenStorageVolumeClient) error {
 func deleteVolumesConcurrently(c api.OpenStorageVolumeClient) error {
 	var wg sync.WaitGroup
 	var volErrorMap = common.NewConcStringErrChanMap()
-	for user, id := range userVolumeMap.GetKeyValMap() {
-		userName := user.(string)
-		volID := id.(string)
+	for userName, volID := range userVolumeMap.GetKeyValMap() {
 		token := scaleUsers[userName]
 		fmt.Printf("\nNow user %s is going to delete volume %s", userName, volID)
 		wg.Add(1)
@@ -162,4 +169,77 @@ func deleteVolumesConcurrently(c api.OpenStorageVolumeClient) error {
 	}
 	wg.Wait()
 	return summarizeErrorsFromStringErrorChanMap(volErrorMap.GetKeyValMap())
+}
+
+func inspectOtherVolumesConcurrently(c api.OpenStorageVolumeClient) error {
+	var wg sync.WaitGroup
+	var volErrorMap = common.NewConcStringErrChanMap()
+	userVolumeKVMap := userVolumeMap.GetKeyValMap()
+	for userName, _ := range userVolumeKVMap {
+		otherUser := getKeyOtherThanInMap(userVolumeKVMap, userName)
+		if otherUser == "" {
+			return fmt.Errorf("failed to find a userName other than %s in userName-volume map", userName)
+		}
+		othersVolID := userVolumeKVMap[otherUser]
+		fmt.Printf("\nNow userName %s is going to inspect other user %s's volume %s", userName, otherUser, othersVolID)
+		token := scaleUsers[userName]
+		wg.Add(1)
+		go func(userName string, othersVolID string, token string) {
+			defer wg.Done()
+			_, err := c.Inspect(
+				setContextWithToken(context.Background(), token),
+				&api.SdkVolumeInspectRequest{
+					VolumeId: othersVolID,
+				},
+			)
+			errChan := make(chan (error), 1)
+			if isPermissionErr(err) {
+				err = nil
+			}
+			errChan <- err
+			volErrorMap.Add(othersVolID, errChan)
+		}(userName, othersVolID, token)
+	}
+	wg.Wait()
+	//Receiving all errors from channels
+	return summarizeErrorsFromStringErrorChanMap(volErrorMap.GetKeyValMap())
+}
+
+func deleteOtherVolumesConcurrently(c api.OpenStorageVolumeClient) error {
+	var wg sync.WaitGroup
+	var volErrorMap = common.NewConcStringErrChanMap()
+	userVolumeKVMap := userVolumeMap.GetKeyValMap()
+	for userName, _ := range userVolumeMap.GetKeyValMap() {
+		token := scaleUsers[userName]
+		otherUser := getKeyOtherThanInMap(userVolumeKVMap, userName)
+		if otherUser == "" {
+			return fmt.Errorf("failed to find a userName other than %s in userName-volume map", userName)
+		}
+		othersVolID := userVolumeKVMap[otherUser]
+		fmt.Printf("\nNow user %s is going to delete other user %s's volume %s", userName, otherUser, othersVolID)
+		wg.Add(1)
+		go func(userName string, othersVolID string, token string) {
+			defer wg.Done()
+			err := deleteVol(
+				setContextWithToken(context.Background(), token),
+				c,
+				othersVolID,
+			)
+			errChan := make(chan (error), 1)
+			if isPermissionErr(err) {
+				err = nil
+			}
+			errChan <- err
+			volErrorMap.Add(othersVolID, errChan)
+		}(userName, othersVolID, token)
+	}
+	wg.Wait()
+	return summarizeErrorsFromStringErrorChanMap(volErrorMap.GetKeyValMap())
+}
+
+func isPermissionErr(err error) bool {
+	if strings.Contains(fmt.Sprintf("%v", err), "PermissionDenied") {
+		return true
+	}
+	return false
 }
